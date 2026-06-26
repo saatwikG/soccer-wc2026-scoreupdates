@@ -1,0 +1,24 @@
+{
+  "api_urls": {
+    "espn_scoreboard": "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
+    "espn_summary": "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary",
+    "espn_standings": "https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings",
+    "telegram_base": "https://api.telegram.org/bot"
+  },
+  "gemini": {
+    "model": "gemini-3.5-flash",
+    "temperature": 0.7,
+    "max_retries": 3
+  },
+  "settings": {
+    "timezone": "America/Chicago",
+    "network_timeout": 10,
+    "tracker_sleep_interval": 10,
+    "listener_sleep_interval": 0.5,
+    "periodic_update_seconds": 900
+  },
+  "files": {
+    "subscribers": "subscribers.json",
+    "prompts": "prompts.json"
+  }
+}
