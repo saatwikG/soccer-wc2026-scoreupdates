@@ -1,6 +1,8 @@
+
 import os
 import json
 import re
+import html
 import time
 import logging
 import asyncio
@@ -50,7 +52,7 @@ try:
     BOT_TOKEN = client.get_secret(BOT_TOKEN_SECRET_NAME).value
     CHAT_ID = client.get_secret(CHAT_ID_SECRET_NAME).value
     GEMINI_API_KEY = client.get_secret(GEMINI_API_KEY_SECRET_NAME).value
-    
+
     # Configure the new Gemini client
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     logger.info("Azure secrets fetched and Gemini client initialized successfully.")
@@ -61,15 +63,13 @@ except Exception as e:
     gemini_client = None
 
 # ==========================================
-# BACKGROUND ALERT DEDUPLICATION
+# GLOBAL MEMORY DICTIONARIES
 # ==========================================
-# Match truth always comes from ESPN's Summary API. These collections only keep
-# push notifications from repeating the same commentary item on every poll.
-notified_commentary_keys = {}
-last_periodic_update = {}
-post_match_recaps_sent = set()
-match_phases = {}
-update_offset = None     
+saved_match_state = {}
+team_names_memory = {}
+last_notified = {}
+seen_commentaries = {}
+update_offset = None
 
 # ==========================================
 # FLAG ENGINE (OFFICIAL 2026 QUALIFIED TEAMS)
@@ -77,31 +77,31 @@ update_offset = None
 TEAM_FLAGS = {
     # Hosts (3)
     "United States": "🇺🇸", "USA": "🇺🇸", "Canada": "🇨🇦", "Mexico": "🇲🇽",
-    
+
     # UEFA / Europe (16)
-    "Austria": "🇦🇹", "Belgium": "🇧🇪", "Bosnia and Herzegovina": "🇧🇦", 
-    "Croatia": "🇭🇷", "Czechia": "🇨🇿", "Czech Republic": "🇨🇿", "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", 
-    "France": "🇫🇷", "Germany": "🇩🇪", "Netherlands": "🇳🇱", "Norway": "🇳🇴", 
-    "Portugal": "🇵🇹", "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "Spain": "🇪🇸", "Sweden": "🇸🇪", 
+    "Austria": "🇦🇹", "Belgium": "🇧🇪", "Bosnia and Herzegovina": "🇧🇦",
+    "Croatia": "🇭🇷", "Czechia": "🇨🇿", "Czech Republic": "🇨🇿", "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "France": "🇫🇷", "Germany": "🇩🇪", "Netherlands": "🇳🇱", "Norway": "🇳🇴",
+    "Portugal": "🇵🇹", "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "Spain": "🇪🇸", "Sweden": "🇸🇪",
     "Switzerland": "🇨🇭", "Turkey": "🇹🇷", "Türkiye": "🇹🇷",
-    
+
     # CONMEBOL / South America (6)
-    "Argentina": "🇦🇷", "Brazil": "🇧🇷", "Colombia": "🇨🇴", 
+    "Argentina": "🇦🇷", "Brazil": "🇧🇷", "Colombia": "🇨🇴",
     "Ecuador": "🇪🇨", "Paraguay": "🇵🇾", "Uruguay": "🇺🇾",
-    
+
     # CAF / Africa (10)
-    "Algeria": "🇩🇿", "Cabo Verde": "🇨🇻", "Cape Verde": "🇨🇻", "Congo DR": "🇨🇩", "DR Congo": "🇨🇩", 
-    "Côte d'Ivoire": "🇨🇮", "Ivory Coast": "🇨🇮", "Egypt": "🇪🇬", "Ghana": "🇬🇭", 
+    "Algeria": "🇩🇿", "Cabo Verde": "🇨🇻", "Cape Verde": "🇨🇻", "Congo DR": "🇨🇩", "DR Congo": "🇨🇩",
+    "Côte d'Ivoire": "🇨🇮", "Ivory Coast": "🇨🇮", "Egypt": "🇪🇬", "Ghana": "🇬🇭",
     "Morocco": "🇲🇦", "Senegal": "🇸🇳", "South Africa": "🇿🇦", "Tunisia": "🇹🇳",
-    
+
     # AFC / Asia (9)
-    "Australia": "🇦🇺", "Iran": "🇮🇷", "IR Iran": "🇮🇷", "Iraq": "🇮🇶", 
-    "Japan": "🇯🇵", "Jordan": "🇯🇴", "South Korea": "🇰🇷", "Korea Republic": "🇰🇷", 
+    "Australia": "🇦🇺", "Iran": "🇮🇷", "IR Iran": "🇮🇷", "Iraq": "🇮🇶",
+    "Japan": "🇯🇵", "Jordan": "🇯🇴", "South Korea": "🇰🇷", "Korea Republic": "🇰🇷",
     "Qatar": "🇶🇦", "Saudi Arabia": "🇸🇦", "Uzbekistan": "🇺🇿",
-    
+
     # CONCACAF / North & Central America (3 Non-Hosts)
     "Curaçao": "🇨🇼", "Haiti": "🇭🇹", "Panama": "🇵🇦",
-    
+
     # OFC / Oceania (1)
     "New Zealand": "🇳🇿"
 }
@@ -148,20 +148,20 @@ subscribers = load_subscribers()
 async def send_telegram_message(session, message, photo_url=None):
     """Broadcasts automated push updates to all subscribed users asynchronously."""
     url_base = f"{APP_CONFIG['api_urls']['telegram_base']}{BOT_TOKEN}/sendMessage"
-    max_length = 1000 if photo_url else 4000 
-    
+    max_length = 1000 if photo_url else 4000
+
     for sub_id in subscribers:
-        temp_msg = message 
-        
+        temp_msg = message
+
         if len(temp_msg) > max_length:
             split_index = temp_msg.rfind('\n', 0, max_length)
             if split_index == -1:
                 split_index = max_length
-            
+
             chunk = temp_msg[:split_index]
             await _dispatch_to_telegram(session, url_base, sub_id, chunk, photo_url)
             temp_msg = temp_msg[split_index:].lstrip('\n')
-            
+
             while len(temp_msg) > 4000:
                 split_index = temp_msg.rfind('\n', 0, 4000)
                 if split_index == -1:
@@ -169,7 +169,7 @@ async def send_telegram_message(session, message, photo_url=None):
                 chunk = temp_msg[:split_index]
                 await _dispatch_to_telegram(session, url_base, sub_id, chunk, photo_url=None)
                 temp_msg = temp_msg[split_index:].lstrip('\n')
-                
+
             if temp_msg.strip():
                 await _dispatch_to_telegram(session, url_base, sub_id, temp_msg, photo_url=None)
         else:
@@ -179,24 +179,24 @@ async def send_telegram_message(session, message, photo_url=None):
 async def _dispatch_to_telegram(session, url_base, target_chat_id, text, photo_url=None):
     """Helper function to execute async POST requests, safely swapping to sendPhoto if needed."""
     network_timeout = APP_CONFIG["settings"]["network_timeout"]
-    
+
     if photo_url:
         method_url = url_base.replace("sendMessage", "sendPhoto")
         payload = {"chat_id": target_chat_id, "photo": photo_url, "caption": text.strip(), "parse_mode": "HTML"}
     else:
         method_url = url_base
         payload = {
-            "chat_id": target_chat_id, 
-            "text": text.strip(), 
+            "chat_id": target_chat_id,
+            "text": text.strip(),
             "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": True}  
+            "link_preview_options": {"is_disabled": True}
         }
-        
+
     try:
         async with session.post(method_url, json=payload, timeout=network_timeout) as response:
             if response.status == 400:
                 logger.warning(f"Telegram rejected HTML formatting for {target_chat_id}. Retrying as plain text...")
-                
+
                 safe_payload = payload.copy()
                 if not photo_url:
                     safe_payload.pop("parse_mode", None)
@@ -205,11 +205,11 @@ async def _dispatch_to_telegram(session, url_base, target_chat_id, text, photo_u
 
                 async with session.post(method_url, json=safe_payload, timeout=network_timeout) as safe_response:
                     safe_response.raise_for_status()
-                    
+
             else:
                 response.raise_for_status()
                 logger.debug(f"Message successfully delivered to {target_chat_id}")
-                
+
     except asyncio.TimeoutError:
         logger.error(f"Timeout while sending message to {target_chat_id}")
     except Exception as e:
@@ -218,257 +218,6 @@ async def _dispatch_to_telegram(session, url_base, target_chat_id, text, photo_u
 # ==========================================
 # ASYNC DATA & SCHEDULE HELPERS
 # ==========================================
-
-def _status_state_from_name(status_name):
-    status_name = (status_name or "").upper()
-    if "IN_PROGRESS" in status_name or "HALFTIME" in status_name:
-        return "in"
-    if "FINAL" in status_name or "POST" in status_name:
-        return "post"
-    if "SCHEDULED" in status_name or "PRE" in status_name:
-        return "pre"
-    return ""
-
-def _safe_first(items):
-    return items[0] if isinstance(items, list) and items else {}
-
-def _get_summary_competition(summary_data, fallback_event=None):
-    fallback_event = fallback_event or {}
-    header = summary_data.get('header', {})
-    competitions = header.get('competitions') or summary_data.get('competitions') or []
-    return _safe_first(competitions) or _safe_first(fallback_event.get('competitions', []))
-
-def _get_status_state(status):
-    status_type = status.get('type', {}) if isinstance(status, dict) else {}
-    return status_type.get('state') or _status_state_from_name(status_type.get('name'))
-
-def _get_event_status_state(event):
-    return _get_status_state(event.get('status', {}))
-
-def _get_team_logo(team_obj):
-    logos = team_obj.get('logos') or []
-    return team_obj.get('logo') or (_safe_first(logos).get('href') if logos else '')
-
-def _get_team_name(team_obj, fallback):
-    return (
-        team_obj.get('name')
-        or team_obj.get('shortDisplayName')
-        or team_obj.get('displayName')
-        or fallback
-    )
-
-def _normalize_score(value):
-    if value in (None, ""):
-        return "0"
-    return str(value)
-
-def format_clock(clock):
-    if clock in (None, ""):
-        return "N/A"
-    text = str(clock).strip()
-    if not text:
-        return "N/A"
-    if text.endswith("'") or ":" in text or not any(char.isdigit() for char in text):
-        return text
-    return f"{text}'"
-
-def parse_match_minute(clock):
-    if isinstance(clock, dict):
-        clock = clock.get('displayValue', '')
-    match = re.search(r'\d+', str(clock or ''))
-    return int(match.group()) if match else None
-
-def parse_espn_datetime(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-def format_play_time(play):
-    time_data = play.get('time', {}) or {}
-    display_value = time_data.get('displayValue') or play.get('clock', {}).get('displayValue') or ""
-    added_time = time_data.get('addedTime')
-    if added_time in (None, "", 0, "0"):
-        added_text = ""
-    else:
-        added_text = str(added_time)
-        if added_text and not added_text.startswith("+"):
-            added_text = f"+{added_text}"
-    return format_clock(f"{display_value}{added_text}" if display_value else "")
-
-def format_commentary_line(play):
-    text = play.get('text') or play.get('shortText') or 'No text provided'
-    return f"[{format_play_time(play)}] {text}"
-
-def get_commentary_key(match_id, play):
-    primary_id = play.get('id') or play.get('sequenceNumber')
-    if primary_id:
-        return f"{match_id}:{primary_id}"
-    event_type = get_play_type_text(play)
-    return f"{match_id}:{format_play_time(play)}:{event_type}:{(play.get('text') or '')[:160]}"
-
-def get_play_type_text(play):
-    play_type = play.get('type') or play.get('playType') or {}
-    if isinstance(play_type, dict):
-        return play_type.get('text') or play_type.get('abbreviation') or play_type.get('name') or ""
-    return str(play_type or "")
-
-def classify_commentary_event(play):
-    type_text = get_play_type_text(play).lower()
-    text = (play.get('text') or play.get('shortText') or '').lower()
-    
-    try:
-        score_value = int(play.get('scoreValue') or 0)
-    except (TypeError, ValueError):
-        score_value = 0
-    
-    if "goal" in type_text or score_value > 0 or play.get('scoringPlay'):
-        return "goal"
-    if "red card" in type_text or "red card" in text or play.get('redCard'):
-        return "red_card"
-    if "yellow card" in type_text or "yellow card" in text or play.get('yellowCard'):
-        return "yellow_card"
-    return "update"
-
-def get_play_team(snapshot, play):
-    play_team_id = str(play.get('team', {}).get('id', ''))
-    if play_team_id:
-        for team in snapshot.get('teams', []):
-            if str(team.get('id')) == play_team_id:
-                return team
-    return None
-
-def get_play_logo(snapshot, play):
-    play_team = get_play_team(snapshot, play)
-    if play_team and play_team.get('logo'):
-        return play_team['logo']
-    teams = snapshot.get('teams', [])
-    return teams[0].get('logo', '') if teams else ''
-
-def get_athlete_name(play):
-    athletes = play.get('athletesInvolved') or play.get('participants') or []
-    athlete = _safe_first(athletes)
-    if isinstance(athlete, dict):
-        return athlete.get('shortName') or athlete.get('displayName') or athlete.get('name') or "A player"
-    return "A player"
-
-def build_match_snapshot(summary_data, fallback_event=None):
-    fallback_event = fallback_event or {}
-    fallback_comp = _safe_first(fallback_event.get('competitions', []))
-    comp = _get_summary_competition(summary_data, fallback_event)
-    header = summary_data.get('header', {})
-    
-    status = comp.get('status') or header.get('status') or fallback_event.get('status', {})
-    status_type = status.get('type', {}) if isinstance(status, dict) else {}
-    venue_data = comp.get('venue') or fallback_comp.get('venue') or summary_data.get('gameInfo', {}).get('venue', {})
-    address = venue_data.get('address', {}) if isinstance(venue_data, dict) else {}
-    location_parts = [
-        venue_data.get('fullName', '') if isinstance(venue_data, dict) else '',
-        address.get('city', ''),
-        address.get('country', '')
-    ]
-    
-    competitors = comp.get('competitors') or fallback_comp.get('competitors') or []
-    if not competitors:
-        competitors = summary_data.get('boxscore', {}).get('teams', [])
-    
-    teams = []
-    for index, competitor in enumerate(competitors[:2]):
-        team_obj = competitor.get('team', {})
-        raw_name = _get_team_name(team_obj, f"Team {index + 1}")
-        display_name = f"{get_flag(raw_name)} {raw_name}" if index == 0 else f"{raw_name} {get_flag(raw_name)}"
-        teams.append({
-            "id": str(team_obj.get('id', '')),
-            "raw_name": raw_name,
-            "display_name": display_name,
-            "score": _normalize_score(competitor.get('score')),
-            "logo": _get_team_logo(team_obj)
-        })
-    
-    return {
-        "match_id": str(header.get('id') or fallback_event.get('id') or comp.get('id') or ''),
-        "group_info": comp.get('altGameNote') or fallback_comp.get('altGameNote') or 'World Cup Match',
-        "location": ", ".join([part for part in location_parts if part]) or "Unknown Stadium",
-        "status_state": _get_status_state(status),
-        "status_name": status_type.get('name', ''),
-        "clock": status.get('displayClock') or status_type.get('shortDetail') or status_type.get('detail') or '',
-        "clock_seconds": status.get('clock'),
-        "period": status.get('period'),
-        "start_time": comp.get('startDate') or comp.get('date') or fallback_comp.get('startDate') or fallback_comp.get('date') or fallback_event.get('date'),
-        "teams": teams,
-        "details": comp.get('details') or summary_data.get('details') or []
-    }
-
-def format_match_context(snapshot):
-    return f"Competition: {snapshot['group_info']}\nVenue: {snapshot['location']}"
-
-def format_scoreline(snapshot):
-    teams = snapshot.get('teams', [])
-    if len(teams) < 2:
-        return "World Cup match"
-    return f"{teams[0]['display_name']} {teams[0]['score']} - {teams[1]['score']} {teams[1]['display_name']}"
-
-def should_send_kickoff_alert(snapshot, now=None):
-    if snapshot.get('status_state') != "in":
-        return False
-    
-    kickoff_window = APP_CONFIG["settings"].get("kickoff_alert_window_minutes", 2)
-    period = snapshot.get('period')
-    if period not in (None, 1):
-        return False
-    
-    clock_seconds = snapshot.get('clock_seconds')
-    if isinstance(clock_seconds, (int, float)):
-        return clock_seconds <= kickoff_window * 60
-    
-    status_minute = parse_match_minute(snapshot.get('clock'))
-    if status_minute is not None:
-        return status_minute <= kickoff_window
-    
-    start_time = parse_espn_datetime(snapshot.get('start_time'))
-    if not start_time:
-        return True
-    
-    now_dt = datetime.fromtimestamp(now or time.time(), tz=start_time.tzinfo)
-    return 0 <= (now_dt - start_time).total_seconds() <= kickoff_window * 60
-
-async def fetch_match_summary(session, match_id):
-    url = f"{APP_CONFIG['api_urls']['espn_summary']}?event={match_id}"
-    try:
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
-            response.raise_for_status()
-            return await response.json()
-    except Exception as e:
-        logger.error(f"Error fetching summary for match {match_id}: {e}")
-        return {}
-
-async def fetch_scoreboard_events(session):
-    url = APP_CONFIG["api_urls"]["espn_scoreboard"]
-    try:
-        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data.get('events', [])
-    except Exception as e:
-        logger.error(f"Error fetching scoreboard events: {e}")
-        return []
-
-async def fetch_match_summaries_by_state(session, wanted_states):
-    summaries = []
-    events = await fetch_scoreboard_events(session)
-    for event in events:
-        match_id = str(event.get('id', ''))
-        if not match_id or _get_event_status_state(event) not in wanted_states:
-            continue
-        summary = await fetch_match_summary(session, match_id)
-        if not summary:
-            continue
-        snapshot = build_match_snapshot(summary, fallback_event=event)
-        if snapshot.get('status_state') in wanted_states:
-            summaries.append((match_id, summary, snapshot))
-    return summaries
 
 def get_team_stats(team_data, details):
     score = int(team_data.get('score', 0))
@@ -482,78 +231,117 @@ def get_team_stats(team_data, details):
     return score, red_cards, yellow_cards
 
 async def fetch_recent_commentary(session, match_id):
-    data = await fetch_match_summary(session, match_id)
-    commentary_data = data.get('commentary', []) if data else []
-    return [format_commentary_line(play) for play in commentary_data[:5]]
+    url = f"{APP_CONFIG['api_urls']['espn_summary']}?event={match_id}"
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
+            response.raise_for_status()
+            data = await response.json()
+            commentary_data = data.get('commentary', [])
+
+        if not commentary_data: return []
+
+        is_first_run = match_id not in seen_commentaries
+        if is_first_run: seen_commentaries[match_id] = set()
+
+        new_events = []
+        for play in commentary_data:
+            time_data = play.get('time', {})
+            minute = time_data.get('displayValue', '')
+            added_time = time_data.get('addedTime', '')
+            time_string = f"{minute}{added_time}'" if minute else "N/A"
+            text = play.get('text', 'No text provided')
+            event_str = f"[{time_string}] {text}"
+
+            if event_str not in seen_commentaries[match_id]:
+                seen_commentaries[match_id].add(event_str)
+                if not is_first_run: new_events.insert(0, event_str)
+        return new_events
+    except Exception as e:
+        logger.error(f"Error fetching commentary for match {match_id}: {e}")
+        return []
 
 async def fetch_full_match_commentary(session, match_id):
-    data = await fetch_match_summary(session, match_id)
-    commentary_data = data.get('commentary', []) if data else []
-    return [format_commentary_line(play) for play in reversed(commentary_data)]
+    url = f"{APP_CONFIG['api_urls']['espn_summary']}?event={match_id}"
+    try:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
+            response.raise_for_status()
+            data = await response.json()
+            commentary_data = data.get('commentary', [])
+
+        if not commentary_data: return []
+
+        all_events = []
+        for play in reversed(commentary_data):
+            time_string = f"{play.get('time', {}).get('displayValue', '')}{play.get('time', {}).get('addedTime', '')}'"
+            all_events.append(f"[{time_string}] {play.get('text', '')}")
+        return all_events
+    except Exception as e:
+        logger.error(f"Error fetching full commentary for match {match_id}: {e}")
+        return []
 
 async def get_upcoming_schedule(session, limit=None):
     """Fetches World Cup matches asynchronously, optionally limiting to the next N games."""
     base_url = APP_CONFIG['api_urls']['espn_scoreboard']
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
+
     try:
-        todaysDate = date.today()  
-        tomorrowDate = todaysDate + timedelta(days=2) 
+        todaysDate = date.today()
+        tomorrowDate = todaysDate + timedelta(days=2)
         date_range = f"{todaysDate.strftime('%Y%m%d')}-{tomorrowDate.strftime('%Y%m%d')}"
-        
+
         async with session.get(f"{base_url}?dates={date_range}", headers=headers, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
             response.raise_for_status()
             data = await response.json()
             events = data.get('events', [])
-        
+
         upcoming_events = [e for e in events if e.get('status', {}).get('type', {}).get('state') == 'pre']
-        
-        if not upcoming_events: 
+
+        if not upcoming_events:
             return "No World Cup matches scheduled in the near future."
-            
+
         if limit:
             upcoming_events = upcoming_events[:limit]
             schedule_msg = f"📅 <b>Next {limit} Upcoming Match{'es' if limit > 1 else ''}</b>\n\n"
         else:
             schedule_msg = "📅 <b>Upcoming Matches (Next 48 Hours)</b>\n\n"
-        
+
         for event in upcoming_events:
             for competition in event.get('competitions', []):
                 group_info = competition.get('altGameNote', 'World Cup Match')
                 stadium = competition.get('venue', {}).get('fullName', 'Unknown')
                 city = competition.get('venue', {}).get('address', {}).get('city', '')
                 country = competition.get('venue', {}).get('address', {}).get('country', '')
-                
+
                 location_parts = [p for p in [stadium, city, country] if p]
                 location_str = ", ".join(location_parts)
-                
+
                 competitors = competition.get('competitors', [])
                 if len(competitors) >= 2:
                     raw_name1 = competitors[0].get('team', {}).get('name', 'Unknown')
                     display_name1 = f"{get_flag(raw_name1)} {raw_name1}"
-                    
+
                     raw_name2 = competitors[1].get('team', {}).get('name', 'Unknown')
                     display_name2 = f"{raw_name2} {get_flag(raw_name2)}"
-                    
+
                     matchup_str = f"{display_name1} vs {display_name2}"
                 else:
                     matchup_str = event.get('name', 'Unknown Matchup')
 
                 matchtime = datetime.fromisoformat(competition['date']).astimezone(ZoneInfo(APP_CONFIG["settings"]["timezone"]))
-                
-                hour = matchtime.strftime("%I").lstrip("0")   
+
+                hour = matchtime.strftime("%I").lstrip("0")
                 am_pm = matchtime.strftime("%p")
-                tz_abbrev = matchtime.strftime("%Z")          
-                month = matchtime.strftime("%B")              
-                day = str(matchtime.day)                      
-                year = matchtime.strftime("%Y")               
-                
+                tz_abbrev = matchtime.strftime("%Z")
+                month = matchtime.strftime("%B")
+                day = str(matchtime.day)
+                year = matchtime.strftime("%Y")
+
                 readable_time = f"{hour}{am_pm} {tz_abbrev} on {month} {day}, {year}"
-                
+
                 schedule_msg += f"⚽ {matchup_str}\n🏆 {group_info}\n🏟️ {location_str}\n⏰ {readable_time}\n\n"
-                
+
         return schedule_msg
-        
+
     except Exception as e:
         logger.error(f"Error checking schedule: {e}")
         return f"⚠️ Error fetching schedule: {e}"
@@ -565,25 +353,25 @@ async def get_match_stats(session, match_id):
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
             response.raise_for_status()
             data = await response.json()
-        
+
         boxscore = data.get('boxscore', {}).get('teams', [])
         if len(boxscore) < 2:
             return None
-            
+
         t1 = boxscore[0]
         t2 = boxscore[1]
-        
+
         t1_name = t1.get('team', {}).get('name', 'Team 1')
         t2_name = t2.get('team', {}).get('name', 'Team 2')
         display_t1 = f"{get_flag(t1_name)} {t1_name}"
         display_t2 = f"{t2_name} {get_flag(t2_name)}"
-        
+
         def extract_stat(stats_list, target_names, target_labels):
             for s in stats_list:
                 if s.get('name') in target_names or s.get('label', '').lower() in target_labels:
                     return s.get('displayValue', '0')
             return "0"
-            
+
         s1_data = t1.get('statistics', [])
         s2_data = t2.get('statistics', [])
 
@@ -605,15 +393,15 @@ async def get_match_stats(session, match_id):
             f"{display_t1} vs {display_t2}",
             "━━━━━━━━━━━━━━━━━━━━"
         ]
-        
+
         for emoji, label, names, labels in stat_blueprint:
             val1 = extract_stat(s1_data, names, labels)
             val2 = extract_stat(s2_data, names, labels)
-            
+
             if label == "Possession" and "%" not in val1:
                 val1 += "%"
                 val2 += "%"
-                
+
             lines.append(f"{val1}  {emoji} <b>{label}</b> {emoji}  {val2}")
 
         return "\n".join(lines)
@@ -641,58 +429,58 @@ def load_prompts():
 async def summarize_events_with_gemini(event_type, raw_data):
     """Generates rich summaries asynchronously using prompts hot-loaded from an external JSON."""
     if not raw_data or not gemini_client:
-        return "" 
-        
+        return ""
+
     max_retries = APP_CONFIG["gemini"]["max_retries"]
 
     prompt_registry = load_prompts()
     system_instruction = prompt_registry.get(
-        event_type, 
+        event_type,
         "You are a helpful sports assistant. Summarize this match data accurately."
     )
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=APP_CONFIG["gemini"]["temperature"], 
+        temperature=APP_CONFIG["gemini"]["temperature"],
     )
 
     for attempt in range(max_retries):
         try:
             # Native async SDK call pulling model directly from config
             response = await gemini_client.aio.models.generate_content(
-                model=APP_CONFIG["gemini"]["model"], 
+                model=APP_CONFIG["gemini"]["model"],
                 contents=str(raw_data),
                 config=config
             )
-            
+
             # --- LOGGING TOKEN CONSUMPTION ---
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
                 in_tokens = response.usage_metadata.prompt_token_count
                 out_tokens = response.usage_metadata.candidates_token_count
                 logger.info(f"Gemini Tokens Used [{event_type}] - In: {in_tokens} | Out: {out_tokens}")
-            
+
             text = response.text.strip()
-            
+
             # 1. Secure the output for Telegram HTML parsing
             text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            
+
             # 2. Convert standard Markdown bullet points to safe Unicode bullets
             text = re.sub(r'^[\*\-]\s+', '• ', text, flags=re.MULTILINE)
-            
+
             # 3. Convert Markdown Headers (###, ##, #) to Bold HTML
             text = re.sub(r'^#+\s+(.*)', r'<b>\1</b>', text, flags=re.MULTILINE)
-            
+
             # 4. Convert Bold-Italic (***text***) to HTML
             text = re.sub(r'\*\*\*(.*?)\*\*\*', r'<b><i>\1</i></b>', text)
-            
+
             # 5. Convert standard Bold (**text**) to HTML
             text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-            
+
             # 6. Convert standard Italic (*text*) to HTML
             text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
-            
+
             return text
-            
+
         except Exception as e:
             logger.warning(f"Gemini API attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
@@ -731,15 +519,15 @@ async def get_world_cup_standings(session):
                 flag = get_flag(team_name)
 
                 if "Advance" in desc:
-                    status_icon = "🟢" 
+                    status_icon = "🟢"
                 elif "Best 8" in desc:
-                    status_icon = "🟡" 
+                    status_icon = "🟡"
                 else:
-                    status_icon = "🔴" 
+                    status_icon = "🔴"
 
                 standings_msg += f"<code>{rank}.</code> {flag} <b>{team_name}</b> {status_icon}\n"
 
-            standings_msg += "\n" 
+            standings_msg += "\n"
 
         return standings_msg
 
@@ -751,220 +539,215 @@ async def get_world_cup_standings(session):
 # BACKGROUND TRACKER (PUSH NOTIFICATIONS)
 # ==========================================
 
-def build_summary_context(snapshot, plays, headline=""):
-    play_lines = "\n".join(format_commentary_line(play) for play in plays)
-    sections = [
-        headline.strip(),
-        f"Current Match State:\n{format_scoreline(snapshot)}",
-        f"Latest Summary API Events:\n{play_lines}" if play_lines else ""
-    ]
-    return "\n\n".join(section for section in sections if section)
-
-async def build_commentary_alert(snapshot, play, latest_plays):
-    event_type = classify_commentary_event(play)
-    match_context = format_match_context(snapshot)
-    scoreline = format_scoreline(snapshot)
-    clock = format_clock(snapshot.get('clock')) if snapshot.get('clock') else format_play_time(play)
-    play_text = play.get('text') or play.get('shortText') or "Latest match event"
-    alert_logo = get_play_logo(snapshot, play)
-    
-    if event_type == "goal":
-        raw_data = build_summary_context(snapshot, latest_plays, f"Event: Goal\nPrimary Event: {format_commentary_line(play)}")
-        summary = await summarize_events_with_gemini("goal", raw_data)
-        goal_context = summary or play_text
-        message = (
-            f"GOAL!\n{match_context}\n\n"
-            f"{scoreline}\n"
-            f"Clock: {clock}\n\n"
-            f"The Goal: {goal_context}"
-        )
-        return message, alert_logo
-    
-    if event_type in ("red_card", "yellow_card"):
-        is_red = event_type == "red_card"
-        card_label = "RED CARD" if is_red else "YELLOW CARD"
-        card_marker = "[RED]" if is_red else "[YELLOW]"
-        player_name = get_athlete_name(play)
-        play_team = get_play_team(snapshot, play)
-        team_name = play_team.get('display_name') if play_team else "the match"
-        raw_data = build_summary_context(snapshot, latest_plays, f"Event: {card_label}\nPrimary Event: {format_commentary_line(play)}")
-        summary = await summarize_events_with_gemini("foul", raw_data)
-        foul_context = summary or play_text
-        message = (
-            f"{card_marker} {card_label}!\n{match_context}\n\n"
-            f"{player_name} ({team_name}) is booked.\n\n"
-            f"What Happened:\n{foul_context}\n\n"
-            f"Clock: {clock}\n"
-            f"Score: {scoreline}"
-        )
-        return message, alert_logo
-    
-    return "", alert_logo
-
-def build_kickoff_alert(snapshot):
-    teams = snapshot.get('teams', [])
-    alert_logo = teams[0].get('logo', '') if teams else ''
-    message = (
-        f"KICKOFF!\n{format_match_context(snapshot)}\n\n"
-        f"{format_scoreline(snapshot)}\n"
-        f"Clock: {format_clock(snapshot.get('clock'))}\n\n"
-        "The match is underway."
-    )
-    return message, alert_logo
-
-async def send_periodic_match_update(session, match_id, snapshot, latest_plays):
-    if not latest_plays:
-        return False
-    
-    match_context = format_match_context(snapshot)
-    scoreline = format_scoreline(snapshot)
-    clock = format_clock(snapshot.get('clock'))
-    raw_data = build_summary_context(snapshot, latest_plays)
-    summary = await summarize_events_with_gemini("match_update", raw_data)
-    
-    alert_msg = (
-        f"MATCH UPDATE\n{match_context}\n\n"
-        f"{scoreline}\n"
-        f"Clock: {clock}"
-    )
-    if summary:
-        alert_msg += f"\n\nSummary:\n{summary}"
-    else:
-        latest_lines = "\n".join([f"- {format_commentary_line(play)}" for play in latest_plays])
-        alert_msg += f"\n\nLatest Action:\n{latest_lines}"
-    
-    await send_telegram_message(session, alert_msg, photo_url=get_play_logo(snapshot, latest_plays[0]))
-    logger.info(f"Periodic update sent for match {match_id}")
-    return True
-
-async def send_post_match_recap(session, match_id, summary_data, snapshot):
-    if match_id in post_match_recaps_sent:
-        return
-    if match_id not in notified_commentary_keys and match_id not in last_periodic_update:
-        return
-    
-    commentary = summary_data.get('commentary', [])
-    full_commentary = [format_commentary_line(play) for play in reversed(commentary)]
-    match_context = format_match_context(snapshot)
-    scoreline = format_scoreline(snapshot)
-    alert_msg = f"FULL TIME\n{match_context}\n\n{scoreline}"
-    
-    if full_commentary:
-        raw_data = f"Match Data (Full Match):\n" + "\n".join(full_commentary)
-        summary = await summarize_events_with_gemini("post_match", raw_data)
-        if summary:
-            alert_msg += f"\n\nTactical Review:\n{summary}"
-    else:
-        comp = _get_summary_competition(summary_data)
-        headlines = summary_data.get('headlines') or comp.get('headlines') or []
-        headline_texts = [
-            hl.get('shortLinkText') or hl.get('headline') or hl.get('description')
-            for hl in headlines
-            if hl
-        ]
-        if headline_texts:
-            headlines_joined = "\n".join([f"- {hl}" for hl in headline_texts if hl])
-            alert_msg += f"\n\n<b>Headlines:</b>\n{headlines_joined}"
-    
-    teams = snapshot.get('teams', [])
-    alert_logo = teams[0].get('logo', '') if teams else ''
-    await send_telegram_message(session, alert_msg, photo_url=alert_logo)
-    post_match_recaps_sent.add(match_id)
-    notified_commentary_keys.pop(match_id, None)
-    last_periodic_update.pop(match_id, None)
-    logger.info(f"Post-match recap sent and background cache cleared for match {match_id}")
-
-async def process_live_match_summary(session, match_id, summary_data, snapshot, periodic_update_time):
-    now = time.time()
-    commentary = summary_data.get('commentary', [])
-    latest_plays = commentary[:5]
-    first_seen = match_id not in notified_commentary_keys
-    seen_keys = notified_commentary_keys.setdefault(match_id, set())
-    last_periodic_update.setdefault(match_id, now)
-    
-    if first_seen:
-        for play in commentary:
-            seen_keys.add(get_commentary_key(match_id, play))
-        if should_send_kickoff_alert(snapshot, now):
-            alert_msg, alert_logo = build_kickoff_alert(snapshot)
-            await send_telegram_message(session, alert_msg, photo_url=alert_logo)
-            last_periodic_update[match_id] = now
-            logger.info(f"Kickoff alert sent for match {match_id}")
-        return
-        
-    new_plays = []
-    for play in reversed(commentary):
-        event_key = get_commentary_key(match_id, play)
-        if event_key not in seen_keys:
-            seen_keys.add(event_key)
-            new_plays.append(play)
-
-    alert_sent = False
-    for play in new_plays:
-        event_type = classify_commentary_event(play)
-        if event_type == "update":
-            continue
-        
-        alert_msg, alert_logo = await build_commentary_alert(snapshot, play, latest_plays)
-        if alert_msg:
-            await send_telegram_message(session, alert_msg, photo_url=alert_logo)
-            alert_sent = True
-            
-    if alert_sent:
-        last_periodic_update[match_id] = now
-        return
-    
-    if now - last_periodic_update.get(match_id, now) >= periodic_update_time:
-        if await send_periodic_match_update(session, match_id, snapshot, latest_plays):
-            last_periodic_update[match_id] = now
-
-async def track_world_cup_scores_from_summary(session):
+async def track_world_cup_scores(session):
+    url = APP_CONFIG["api_urls"]["espn_scoreboard"]
     periodic_update_time = APP_CONFIG["settings"]["periodic_update_seconds"]
-    
+
     try:
-        events = await fetch_scoreboard_events(session)
+        async with session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
+            if response.status != 200:
+                logger.warning(f"Tracker received non-200 status: {response.status}")
+                return
+            data = await response.json()
+
+        events = data.get('events', [])
+
         for event in events:
-            match_id = str(event.get('id', ''))
-            scoreboard_state = _get_event_status_state(event)
-            if not match_id or scoreboard_state not in ("in", "post"):
+            match_id = event['id']
+            status_state = event['status']['type']['state']
+
+            # Skip fully processed matches
+            if status_state == 'post' and match_id in saved_match_state and saved_match_state[match_id].split('-')[-1] == 'post':
                 continue
-            
-            summary_data = await fetch_match_summary(session, match_id)
-            if not summary_data:
+
+            clock = event['status']['displayClock']
+            competitions = event['competitions']
+            details = competitions[0].get('details', [])
+
+            comp_data = competitions[0]
+            group_info = comp_data.get('altGameNote', 'World Cup Match')
+            venue_data = comp_data.get('venue', {})
+            stadium = venue_data.get('fullName', 'Unknown Stadium')
+            city = venue_data.get('address', {}).get('city', '')
+            country = venue_data.get('address', {}).get('country', '')
+
+            location_str = ", ".join([p for p in [stadium, city, country] if p])
+            match_context = f"🏆 {group_info}\n🏟️ {location_str}"
+
+            competitors = comp_data.get('competitors', [])
+            if not competitors or len(competitors) < 2: continue
+
+            # TEAM 1
+            team1_obj = competitors[0].get('team', {})
+            raw_name1 = team1_obj.get('name', 'Unknown')
+            name1 = f"{get_flag(raw_name1)} {raw_name1}"
+            logo1 = team1_obj.get('logo') or (team1_obj.get('logos')[0].get('href') if team1_obj.get('logos') else '')
+            score1, red1, yellow1 = get_team_stats(competitors[0], details)
+
+            # TEAM 2
+            team2_obj = competitors[1].get('team', {})
+            raw_name2 = team2_obj.get('name', 'Unknown')
+            name2 = f"{raw_name2} {get_flag(raw_name2)}"
+            logo2 = team2_obj.get('logo') or (team2_obj.get('logos')[0].get('href') if team2_obj.get('logos') else '')
+            score2, red2, yellow2 = get_team_stats(competitors[1], details)
+
+            current_state = f"{score1}-{score2}-{red1}-{red2}-{yellow1}-{yellow2}-{status_state}"
+
+            team_names_memory[match_id] = (name1, name2)
+
+            if match_id not in saved_match_state:
+                saved_match_state[match_id] = current_state
+                last_notified[match_id] = time.time()
                 continue
-            
-            snapshot = build_match_snapshot(summary_data, fallback_event=event)
-            if not snapshot.get('status_state'):
-                snapshot['status_state'] = scoreboard_state
-            
-            # --- Kickoff Detection via State Transition ---
-            current_period = snapshot.get('period')
-            current_status_name = snapshot.get('status_name', '').upper()
-            
-            old_phase = match_phases.get(match_id)
-            if old_phase:
-                old_period, old_status_name = old_phase
-                
-                # Detect Second Half Kickoff (Halftime -> In Progress)
-                if old_status_name == "STATUS_HALFTIME" and current_status_name == "STATUS_IN_PROGRESS":
-                    alert_msg = f"⚽ **SECOND HALF KICKOFF!**\n{format_match_context(snapshot)}\n\n{format_scoreline(snapshot)}\n\nThe second half is underway!"
-                    teams = snapshot.get('teams', [])
-                    alert_logo = teams[0].get('logo', '') if teams else ''
-                    await send_telegram_message(session, alert_msg, photo_url=alert_logo)
-                    logger.info(f"Second half kickoff alert sent for match {match_id}")
-            
-            match_phases[match_id] = (current_period, current_status_name)
-            
-            if snapshot['status_state'] == "in":
-                await process_live_match_summary(session, match_id, summary_data, snapshot, periodic_update_time)
-            elif snapshot['status_state'] == "post":
-                await send_post_match_recap(session, match_id, summary_data, snapshot)
+
+            alert_msg = ""
+            alert_logo = None
+            event_triggered = False
+
+            if current_state != saved_match_state[match_id]:
+                old_state = saved_match_state[match_id].split('-')
+                old_score1, old_score2 = int(old_state[0]), int(old_state[1])
+                old_red1, old_red2 = int(old_state[2]), int(old_state[3])
+                old_yellow1, old_yellow2 = int(old_state[4]), int(old_state[5])
+                old_status_state = old_state[6] if len(old_state) > 6 else 'pre'
+
+                # 1. MATCH FINISHED & POST MATCH RECAP
+                if status_state == 'post' and old_status_state != 'post':
+                    alert_logo = logo1 if logo1 else logo2
+                    alert_msg = f"🏁 FULL TIME \n{match_context}\n\n{name1} {score1} - {score2} {name2}"
+
+                    full_commentary = await fetch_full_match_commentary(session, match_id)
+                    if full_commentary:
+                        commentary_str = "\n".join(full_commentary)
+                        raw_data = f"Match Data (Full Match):\n{commentary_str}"
+                        summary = await summarize_events_with_gemini("post_match", raw_data)
+                        if summary:
+                            alert_msg += f"\n\n🏆 Tactical Review: \n{summary}"
+                    else:
+                        headlines = event.get('headlines', [])
+                        if not headlines and event.get('competitions'):
+                            headlines = event['competitions'][0].get('headlines', [])
+                        if headlines:
+                            headline_texts = [hl.get('shortLinkText') or hl.get('headline') or hl.get('description') for hl in headlines if hl]
+                            if headline_texts:
+                                headlines_joined = "\n".join([f"• {hl}" for hl in headline_texts])
+                                alert_msg += f"\n\n📰 <b> Headlines:</b> \n{headlines_joined}"
+
+                    event_triggered = True
+                    seen_commentaries.pop(match_id, None)
+                    logger.info(f"🧹 Cleared commentary memory for completed match: {name1} vs {name2}")
+
+                # 2. LIVE EVENTS
+                elif status_state == 'in':
+                    # --- Goals ---
+                    if score1 > old_score1 or score2 > old_score2:
+                        scoring_team_id = competitors[0]['team']['id'] if score1 > old_score1 else competitors[1]['team']['id']
+                        alert_logo = logo1 if score1 > old_score1 else logo2
+
+                        goal_desc = "A brilliant finish"
+                        for detail in reversed(details):
+                            if detail.get('scoreValue') == 1 and detail.get('team', {}).get('id') == scoring_team_id:
+                                goal_desc = detail.get('type', {}).get('text', 'A brilliant finish')
+                                if detail.get('penaltyKick', False): goal_desc = "Penalty Kick"
+                                elif detail.get('ownGoal', False): goal_desc = "Own Goal"
+                                break
+
+                        goal_context = f"Event: {goal_desc}"
+                        recent_comments = await fetch_recent_commentary(session, match_id)
+                        if recent_comments:
+                            commentary_str = "\n".join(recent_comments)
+                            raw_data = f"Event: Goal Scored ({goal_desc})\nRecent Play-by-Play:\n{commentary_str}"
+                            summary = await summarize_events_with_gemini("goal", raw_data)
+                            if summary: goal_context = f"The Goal: {summary}"
+                            else: goal_context += "\n" + "\n".join([f"• {c}" for c in recent_comments])
+
+                        alert_msg = f"⚽ GOAL! \n{match_context}\n\n{name1} {score1} - {score2} {name2}\n⏰ Clock: {clock}'\n\n{goal_context}"
+                        event_triggered = True
+
+                    # --- Red Cards ---
+                    elif red1 > old_red1 or red2 > old_red2:
+                        card_team = name1 if red1 > old_red1 else name2
+                        alert_logo = logo1 if red1 > old_red1 else logo2
+                        card_team_id = competitors[0]['team']['id'] if red1 > old_red1 else competitors[1]['team']['id']
+                        men_down_msg = f"{card_team} is down to 10 men."
+
+                        player_name = "A player"
+                        offense_desc = "Foul"
+                        for detail in reversed(details):
+                            if detail.get('redCard', False) and detail.get('team', {}).get('id') == card_team_id:
+                                athletes = detail.get('athletesInvolved', [])
+                                if athletes: player_name = athletes[0].get('shortName', athletes[0].get('displayName', player_name))
+                                offense_desc = detail.get('type', {}).get('text', offense_desc)
+                                break
+
+                        foul_context = f"Reason: {offense_desc}"
+                        recent_comments = await fetch_recent_commentary(session, match_id)
+                        if recent_comments:
+                            commentary_str = "\n".join(recent_comments)
+                            raw_data = f"Event: RED CARD issued to {player_name} ({card_team}) for '{offense_desc}'.\nRecent Play-by-Play:\n{commentary_str}"
+                            summary = await summarize_events_with_gemini("foul", raw_data)
+                            if summary: foul_context = f"What Happened: \n{summary}"
+
+                        alert_msg = f"🟥 RED CARD! \n{match_context}\n\n{player_name} ({card_team}) has been sent off!\n\n{foul_context}\n\n⏰ Clock: {clock}'\n{men_down_msg}"
+                        event_triggered = True
+
+                    # --- Yellow Cards ---
+                    elif yellow1 > old_yellow1 or yellow2 > old_yellow2:
+                        card_team = name1 if yellow1 > old_yellow1 else name2
+                        alert_logo = logo1 if yellow1 > old_yellow1 else logo2
+                        card_team_id = competitors[0]['team']['id'] if yellow1 > old_yellow1 else competitors[1]['team']['id']
+
+                        player_name = "A player"
+                        offense_desc = "Foul"
+                        for detail in reversed(details):
+                            if detail.get('yellowCard', False) and detail.get('team', {}).get('id') == card_team_id:
+                                athletes = detail.get('athletesInvolved', [])
+                                if athletes: player_name = athletes[0].get('shortName', athletes[0].get('displayName', player_name))
+                                offense_desc = detail.get('type', {}).get('text', offense_desc)
+                                break
+
+                        foul_context = f"Reason: {offense_desc}"
+                        recent_comments = await fetch_recent_commentary(session, match_id)
+                        if recent_comments:
+                            commentary_str = "\n".join(recent_comments)
+                            raw_data = f"Event: YELLOW CARD issued to {player_name} ({card_team}) for '{offense_desc}'.\nRecent Play-by-Play:\n{commentary_str}"
+                            summary = await summarize_events_with_gemini("foul", raw_data)
+                            if summary: foul_context = f"The Foul: {summary}"
+
+                        alert_msg = f"🟨 YELLOW CARD! \n{match_context}\n\nBooking for {player_name} ({card_team})!\n\n{foul_context}\n\n⏰ Clock: {clock}'\nScore remains: {name1} {score1} - {score2} {name2}"
+                        event_triggered = True
+
+                saved_match_state[match_id] = current_state
+
+            # 3. PERIODIC UPDATES
+            if status_state == 'in' and not event_triggered:
+                seconds_since_last_alert = time.time() - last_notified.get(match_id, time.time())
+                if seconds_since_last_alert >= periodic_update_time:
+                    recent_comments = await fetch_recent_commentary(session, match_id)
+                    if recent_comments:
+                        alert_logo = logo1 if logo1 else logo2
+                        alert_msg = f"⏱️ MATCH UPDATE \n{match_context}\n\n{name1} {score1} - {score2} {name2}\n⏰ Clock: {clock}'"
+
+                        commentary_str = "\n".join(recent_comments)
+                        raw_data = f"Recent Play-by-Play:\n{commentary_str}"
+                        summary = await summarize_events_with_gemini("match_update", raw_data)
+
+                        if summary:
+                            alert_msg += f"\n\nSummary: \n{summary}"
+                        else:
+                            alert_msg += "\n\nLatest Action: \n" + "\n".join([f"• {c}" for c in recent_comments])
+                        event_triggered = True
+                    else:
+                        last_notified[match_id] = time.time()
+
+            # --- FIRE DISPATCH ---
+            if event_triggered and alert_msg:
+                await send_telegram_message(session, alert_msg, photo_url=alert_logo)
+                logger.info(f"Update successfully sent for {name1} vs {name2}")
+                last_notified[match_id] = time.time()
 
     except Exception as e:
         logger.error(f"Error checking API in background tracker: {e}")
-
-async def track_world_cup_scores(session):
-    await track_world_cup_scores_from_summary(session)
 
 # ==========================================
 # ASYNC INTERACTIVE INLINE MENU UI
@@ -973,7 +756,7 @@ async def send_inline_menu(session, chat_id, custom_text=None):
     """Sends the sleek inline menu, adapting the text based on context."""
     url = f"{APP_CONFIG['api_urls']['telegram_base']}{BOT_TOKEN}/sendMessage"
     text = custom_text if custom_text else "🏆 <b>World Cup Tracker</b>\n\nSelect an option below:"
-    
+
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -986,7 +769,7 @@ async def send_inline_menu(session, chat_id, custom_text=None):
             ]
         }
     }
-    
+
     try:
         async with session.post(url, json=payload, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
             response.raise_for_status()
@@ -1001,7 +784,7 @@ async def handle_user_commands(session, chat_id, text):
     """Processes predefined interactive commands from Telegram users."""
     command = text.strip().lower()
     is_new_user = str(chat_id) not in subscribers
-    save_subscriber(chat_id) 
+    save_subscriber(chat_id)
 
     url_base = f"{APP_CONFIG['api_urls']['telegram_base']}{BOT_TOKEN}/sendMessage"
 
@@ -1012,46 +795,43 @@ async def handle_user_commands(session, chat_id, text):
         else:
             welcome_back_msg = "🏆 <b>World Cup Tracker</b>\n\nWelcome back! You are already subscribed to live alerts.\n\nChoose an option below:"
             await send_inline_menu(session, chat_id, custom_text=welcome_back_msg)
-        
+
     elif command in ('/help', '/menu'):
         await send_inline_menu(session, chat_id)
-        
+
     elif command == '/score':
-        live_matches = await fetch_match_summaries_by_state(session, {"in"})
-        
+        live_matches = [mid for mid, state in saved_match_state.items() if state.split('-')[-1] == 'in']
+
         if not live_matches:
             fallback_msg = "⚠️ There are no live World Cup matches playing right now.\n\n"
             upcoming_two = await get_upcoming_schedule(session, limit=2)
             await _dispatch_to_telegram(session, url_base, chat_id, fallback_msg + upcoming_two)
             return
-            
+
         score_msg = "🏆 <b>LIVE SCORES</b>\n\n"
-        for match_id, summary_data, snapshot in live_matches:
-            latest_plays = summary_data.get('commentary', [])[:2]
-            score_msg += f"Match: {format_scoreline(snapshot)}\n"
-            score_msg += f"Clock: {format_clock(snapshot.get('clock'))}\n"
-            if latest_plays:
-                score_msg += "Latest:\n"
-                score_msg += "\n".join([f"- {format_commentary_line(play)}" for play in latest_plays])
-                score_msg += "\n"
-            score_msg += "\n"
-                
+        for match_id, state in saved_match_state.items():
+            parts = state.split('-')
+            if parts[-1] == 'in':
+                score1, score2 = parts[0], parts[1]
+                name1, name2 = team_names_memory.get(match_id, ("Team 1", "Team 2"))
+                score_msg += f"⚽ {name1} {score1} - {score2} {name2}\n"
+
         await _dispatch_to_telegram(session, url_base, chat_id, score_msg)
 
     elif command == '/livestats':
-        live_matches = await fetch_match_summaries_by_state(session, {"in"})
-        
+        live_matches = [mid for mid, state in saved_match_state.items() if state.split('-')[-1] == 'in']
+
         if not live_matches:
             await _dispatch_to_telegram(session, url_base, chat_id, "⚠️ No live matches currently in progress.")
             return
-            
-        for match_id, _, _ in live_matches:
+
+        for match_id in live_matches:
             stats_text = await get_match_stats(session, match_id)
             if stats_text:
                 await _dispatch_to_telegram(session, url_base, chat_id, stats_text)
             else:
                 await _dispatch_to_telegram(session, url_base, chat_id, "⚠️ Could not load stats for a current match.")
-    
+
     elif command == '/standings':
         standings_text = await get_world_cup_standings(session)
         await _dispatch_to_telegram(session, url_base, chat_id, standings_text)
@@ -1066,7 +846,7 @@ async def handle_user_commands(session, chat_id, text):
             "/start - Subscribe to bot updates\n"
             "/score - Get live status & commentary of current matches\n"
             "/livestats - View detailed data & stats for live matches\n"
-            "/standings - View the current group stage tables\n" 
+            "/standings - View the current group stage tables\n"
             "/schedule - View games for the next 2 days\n"
             "/help - Show this menu"
         )
@@ -1080,29 +860,29 @@ async def check_telegram_updates(session):
     """Polls Telegram for new user messages and button clicks rapidly."""
     global update_offset
     url = f"{APP_CONFIG['api_urls']['telegram_base']}{BOT_TOKEN}/getUpdates"
-    
+
     # Safely construct the parameters dictionary
     params = {"timeout": 1}
     if update_offset is not None:
         params["offset"] = update_offset
-    
+
     try:
         async with session.get(url, params=params, timeout=APP_CONFIG["settings"]["network_timeout"]) as response:
             if response.status == 200:
                 data = await response.json()
                 for result in data.get("result", []):
                     update_offset = result["update_id"] + 1
-                    
+
                     if "message" in result and "text" in result["message"]:
                         chat_id = result["message"]["chat"]["id"]
                         text = result["message"]["text"]
                         await handle_user_commands(session, chat_id, text)
-                        
+
                     elif "callback_query" in result:
                         chat_id = result["callback_query"]["message"]["chat"]["id"]
                         button_data = result["callback_query"]["data"]
                         callback_id = result["callback_query"]["id"]
-                        
+
                         try:
                             # Acknowledge the callback quickly to stop loading spinner on mobile
                             cb_url = f"{APP_CONFIG['api_urls']['telegram_base']}{BOT_TOKEN}/answerCallbackQuery"
@@ -1110,7 +890,7 @@ async def check_telegram_updates(session):
                                 cb_response.raise_for_status()
                         except Exception as e:
                             logger.debug(f"Failed to answer callback query: {e}")
-                            
+
                         # Treat button press like text input
                         await handle_user_commands(session, chat_id, button_data)
     except asyncio.TimeoutError:
@@ -1140,7 +920,7 @@ async def async_background_tracker(session):
 
 async def main():
     logger.info("🚀 Pro World Cup Tracker Booted Up (Fully Asyncio Mode)...")
-    
+
     # Establish a single AIOHTTP session for the entire application lifecycle
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
