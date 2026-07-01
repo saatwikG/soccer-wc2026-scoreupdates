@@ -15,7 +15,8 @@
     "network_timeout": 10,
     "tracker_sleep_interval": 10,
     "listener_sleep_interval": 0.5,
-    "periodic_update_seconds": 900
+    "periodic_update_seconds": 900,
+    "final_date": "20260719"
   },
   "files": {
     "subscribers": "subscribers.json",

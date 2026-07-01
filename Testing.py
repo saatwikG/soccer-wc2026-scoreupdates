@@ -6,12 +6,26 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X",
     "Accept": "application/json"
 }
+target_tz = ZoneInfo("America/Chicago")
+todaysDate = datetime.now(target_tz).date()
+print(f"Today's date: {todaysDate}")
+targetDate = date(2026, 7, 19)
+days_remaining = targetDate - todaysDate
+finalDate = todaysDate + days_remaining
+date_range = f"{todaysDate.strftime('%Y%m%d')}-{finalDate.strftime('%Y%m%d')}"
+print(f"Fetching events from {date_range}")
+data = requests.get("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260629-20260719", headers=headers).json()
+for event in data['events']:
+    for competition in event['competitions']:
+        print(f"{competition['status']['type']['name']}")
+        for detail in competition['details']:
+            print(f"  {detail['type']['text']}")
 
-teams = requests.get("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=760459", headers=headers).json().get('boxscore').get('teams', [])
-for team in teams:
-    print(f"{team['team']['name']}")
-    for detail in team['statistics']:
-        print(f" {detail['label']} - {detail['displayValue']}")
+# teams = requests.get("https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=760459", headers=headers).json().get('boxscore').get('teams', [])
+# for team in teams:
+#     print(f"{team['team']['name']}")
+#     for detail in team['statistics']:
+#         print(f" {detail['label']} - {detail['displayValue']}")
 
 # todaysDate = date.today()  # Get today's date
 # tomorrowDate = todaysDate + timedelta(days=1)  # Get tomorrow's date
